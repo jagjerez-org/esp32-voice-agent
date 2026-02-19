@@ -7,13 +7,13 @@
 
 // ── State Machine ─────────────────────────────────────
 enum State {
-  STATE_IDLE,
-  STATE_LISTENING,
-  STATE_SENDING,
-  STATE_PLAYING
+  STATE_LISTENING,    // Always listening, waiting for speech
+  STATE_RECORDING,    // Speech detected, recording
+  STATE_SENDING,      // Sending audio to server
+  STATE_PLAYING       // Playing response
 };
 
-State currentState = STATE_IDLE;
+State currentState = STATE_LISTENING;
 
 // ── Audio Buffers (PSRAM) ─────────────────────────────
 uint8_t* audioRecordBuffer = nullptr;
@@ -21,73 +21,105 @@ uint8_t* audioPlayBuffer = nullptr;
 size_t recordedBytes = 0;
 size_t playBufferSize = 0;
 
+// ── VAD State ─────────────────────────────────────────
+unsigned long speechStartTime = 0;
+unsigned long lastSpeechTime = 0;
+bool speechActive = false;
+
 // ── Forward declarations ──────────────────────────────
 void setupWiFi();
 void setupI2SMic();
 void setupI2SSpk();
-void startRecording();
-void stopRecording();
-bool detectSilence(int16_t* samples, size_t count);
+void stopI2S(i2s_port_t port);
 void sendAudioToServer();
 void playAudioFromServer(uint8_t* data, size_t len);
-void stopI2S(i2s_port_t port);
+int16_t calculateRMS(int16_t* samples, size_t count);
+void setLED(bool on);
 
 // ══════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n🎤 ESP32 Voice Agent starting...");
+  Serial.println("\n🎤 ESP32 Voice Agent (VAD mode) starting...");
 
   // Use PSRAM for audio buffers
-  audioRecordBuffer = (uint8_t*)ps_malloc(I2S_MIC_SAMPLE_RATE * 2 * (RECORD_DURATION_MS / 1000 + 1));
-  audioPlayBuffer = (uint8_t*)ps_malloc(512 * 1024);  // 512KB play buffer
+  size_t recordBufSize = I2S_MIC_SAMPLE_RATE * 2 * (RECORD_DURATION_MS / 1000 + 1);
+  audioRecordBuffer = (uint8_t*)ps_malloc(recordBufSize);
+  audioPlayBuffer = (uint8_t*)ps_malloc(512 * 1024);
 
   if (!audioRecordBuffer || !audioPlayBuffer) {
     Serial.println("❌ PSRAM allocation failed!");
     while (true) delay(1000);
   }
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  setupWiFi();
+  pinMode(LED_PIN, OUTPUT);
+  setLED(false);
 
-  Serial.println("✅ Ready! Press BOOT button to talk.");
+  setupWiFi();
+  setupI2SMic();
+
+  Serial.println("✅ Ready! Listening for speech...");
 }
 
 void loop() {
   switch (currentState) {
-    case STATE_IDLE: {
-      // Push-to-talk: BOOT button (active LOW)
-      if (digitalRead(BUTTON_PIN) == LOW) {
-        delay(50);  // debounce
-        if (digitalRead(BUTTON_PIN) == LOW) {
-          Serial.println("🎙️ Listening...");
-          currentState = STATE_LISTENING;
-          setupI2SMic();
-          recordedBytes = 0;
+    case STATE_LISTENING: {
+      // Continuously read mic and check for speech
+      int16_t samples[AUDIO_BUFFER_SIZE / 2];
+      size_t bytesRead = 0;
+      i2s_read(I2S_MIC_PORT, samples, AUDIO_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
+
+      int16_t rms = calculateRMS(samples, bytesRead / 2);
+
+      if (rms > VAD_SPEECH_THRESHOLD) {
+        // Speech detected! Start recording
+        Serial.printf("🎙️ Speech detected (RMS: %d) — recording...\n", rms);
+        setLED(true);
+        currentState = STATE_RECORDING;
+        recordedBytes = 0;
+        speechStartTime = millis();
+        lastSpeechTime = millis();
+        speechActive = true;
+
+        // Copy this first chunk
+        if (bytesRead > 0) {
+          memcpy(audioRecordBuffer, samples, bytesRead);
+          recordedBytes = bytesRead;
         }
       }
       break;
     }
 
-    case STATE_LISTENING: {
-      // Record audio chunks
+    case STATE_RECORDING: {
       int16_t samples[AUDIO_BUFFER_SIZE / 2];
       size_t bytesRead = 0;
-
       i2s_read(I2S_MIC_PORT, samples, AUDIO_BUFFER_SIZE, &bytesRead, portMAX_DELAY);
 
-      if (bytesRead > 0 && recordedBytes + bytesRead < I2S_MIC_SAMPLE_RATE * 2 * (RECORD_DURATION_MS / 1000)) {
+      // Store audio
+      size_t maxBytes = I2S_MIC_SAMPLE_RATE * 2 * (RECORD_DURATION_MS / 1000);
+      if (bytesRead > 0 && recordedBytes + bytesRead < maxBytes) {
         memcpy(audioRecordBuffer + recordedBytes, samples, bytesRead);
         recordedBytes += bytesRead;
       }
 
-      // Stop on button release or max duration or silence
-      bool buttonReleased = digitalRead(BUTTON_PIN) == HIGH;
-      bool maxDuration = recordedBytes >= (size_t)(I2S_MIC_SAMPLE_RATE * 2 * (RECORD_DURATION_MS / 1000));
-      bool silence = detectSilence(samples, bytesRead / 2);
+      // VAD: check if speech is ongoing
+      int16_t rms = calculateRMS(samples, bytesRead / 2);
 
-      if (buttonReleased || maxDuration) {
-        Serial.printf("⏹️ Recorded %d bytes\n", recordedBytes);
+      if (rms > VAD_SILENCE_THRESHOLD) {
+        lastSpeechTime = millis();
+      }
+
+      unsigned long now = millis();
+      bool maxDuration = (now - speechStartTime) >= RECORD_DURATION_MS;
+      bool silenceTimeout = (now - lastSpeechTime) >= VAD_SILENCE_END_MS;
+      bool minSpeech = (now - speechStartTime) >= VAD_SPEECH_MIN_MS;
+
+      if ((silenceTimeout && minSpeech) || maxDuration) {
+        Serial.printf("⏹️ Recording done: %d bytes, %lu ms\n",
+          recordedBytes, now - speechStartTime);
+        setLED(false);
+
+        // Stop mic before sending
         stopI2S(I2S_MIC_PORT);
         currentState = STATE_SENDING;
       }
@@ -101,20 +133,35 @@ void loop() {
     }
 
     case STATE_PLAYING: {
-      // Playback handled in sendAudioToServer callback
-      // Return to idle after playback
-      currentState = STATE_IDLE;
-      Serial.println("✅ Ready! Press BOOT button to talk.");
+      // Re-initialize mic and go back to listening
+      setupI2SMic();
+      currentState = STATE_LISTENING;
+      Serial.println("✅ Listening for speech...");
       break;
     }
   }
+}
+
+// ── RMS Calculation ───────────────────────────────────
+int16_t calculateRMS(int16_t* samples, size_t count) {
+  if (count == 0) return 0;
+  int64_t sumSquares = 0;
+  for (size_t i = 0; i < count; i++) {
+    sumSquares += (int64_t)samples[i] * samples[i];
+  }
+  return (int16_t)sqrt((double)sumSquares / count);
+}
+
+// ── LED Control ───────────────────────────────────────
+void setLED(bool on) {
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
 }
 
 // ── WiFi Setup ────────────────────────────────────────
 void setupWiFi() {
   Serial.printf("📶 Connecting to %s", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  WiFi.setSleep(false);  // Keep WiFi active for low latency
+  WiFi.setSleep(false);
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 30) {
@@ -187,18 +234,6 @@ void setupI2SSpk() {
   i2s_zero_dma_buffer(I2S_SPK_PORT);
 }
 
-// ── Silence Detection ─────────────────────────────────
-bool detectSilence(int16_t* samples, size_t count) {
-  if (count == 0) return false;
-
-  int64_t sum = 0;
-  for (size_t i = 0; i < count; i++) {
-    sum += abs(samples[i]);
-  }
-  int16_t avg = sum / count;
-  return avg < SILENCE_THRESHOLD;
-}
-
 // ── Stop I2S ──────────────────────────────────────────
 void stopI2S(i2s_port_t port) {
   i2s_stop(port);
@@ -209,7 +244,7 @@ void stopI2S(i2s_port_t port) {
 void sendAudioToServer() {
   if (recordedBytes == 0) {
     Serial.println("⚠️ No audio recorded");
-    currentState = STATE_IDLE;
+    currentState = STATE_PLAYING;
     return;
   }
 
@@ -219,12 +254,11 @@ void sendAudioToServer() {
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("X-Sample-Rate", String(I2S_MIC_SAMPLE_RATE));
   http.addHeader("X-Bit-Depth", String(I2S_MIC_SAMPLE_BITS));
-  http.setTimeout(30000);  // 30s timeout for LLM response
+  http.setTimeout(30000);
 
   int httpCode = http.POST(audioRecordBuffer, recordedBytes);
 
   if (httpCode == 200) {
-    // Response is raw PCM audio
     int len = http.getSize();
     WiFiClient* stream = http.getStreamPtr();
 
@@ -263,7 +297,6 @@ void playAudioFromServer(uint8_t* data, size_t len) {
     i2s_write(I2S_SPK_PORT, data + offset, toWrite, &bytesWritten, portMAX_DELAY);
     offset += bytesWritten;
   }
-  // Flush with silence
   uint8_t silence[1024] = {0};
   size_t written;
   i2s_write(I2S_SPK_PORT, silence, sizeof(silence), &written, portMAX_DELAY);

@@ -24,11 +24,14 @@
 #define I2S_SPK_SAMPLE_RATE  16000
 #define I2S_SPK_SAMPLE_BITS  16
 
-// ── Audio ─────────────────────────────────────────────
-#define RECORD_DURATION_MS   5000    // Max recording per chunk
-#define SILENCE_THRESHOLD    500     // Silence detection threshold
-#define SILENCE_DURATION_MS  1500    // Stop after this much silence
+// ── Audio / VAD ───────────────────────────────────────
+#define RECORD_DURATION_MS   10000   // Max recording per chunk
+#define VAD_SPEECH_THRESHOLD 800     // Amplitude to detect speech start
+#define VAD_SILENCE_THRESHOLD 400    // Amplitude to detect speech end
+#define VAD_SPEECH_MIN_MS    300     // Min speech duration to accept
+#define VAD_SILENCE_END_MS   1500    // Silence after speech to stop recording
+#define VAD_WINDOW_MS        50      // VAD analysis window
 #define AUDIO_BUFFER_SIZE    1024    // I2S read buffer size
 
-// ── Button ────────────────────────────────────────────
-#define BUTTON_PIN     0   // BOOT button for push-to-talk
+// ── LED Feedback ──────────────────────────────────────
+#define LED_PIN        2    // Built-in LED (or RGB via neopixel)
